@@ -1,0 +1,65 @@
+import json
+import pandas as pd
+import numpy as np
+from backend.prompts import system_prompt, User_prompt
+
+class Core:
+    def dataprocessing(self, df, layout, FHIR_Resource, df_tc, df_ip, chglog):
+        """
+        Process the input data and format the prompts
+        
+        Args:
+            df: The mapping DataFrame
+            layout: The selected layout type
+            FHIR_Resource: The selected FHIR resource
+            df_tc: The test case DataFrame (optional)
+            df_ip: The HL7 content (optional)
+            chglog: The changelog text (optional)
+            
+        Returns:
+            tuple: (formatted_sys_prompt, formatted_user_prompt)
+        """
+        # Drop the very first column since this is an empty column.
+        df.drop(df.columns[0], axis=1, inplace=True)
+
+        # Drop the second column since this is an empty column.
+        df.drop(df.columns[0], axis=1, inplace=True)  # After dropping the first column, the second column becomes first.
+
+        # Convert NaN to None
+        df.replace({np.nan: None}, inplace=True)
+
+        # Convert to JSON format
+        json_data = {"instances": df.to_dict(orient='records')}
+
+        # Serialize the payload to a JSON string
+        json_result = json.dumps(json_data, indent=4)
+
+        if df_tc is not None:
+            resulttc = df_tc.to_dict(orient='records')
+        else:
+            resulttc = []  # Assign an empty list
+
+        if df_ip is not None:
+            resultip = df_ip
+        else:
+            resultip = ""  # Assign an empty string for HL7 content
+
+        json_result_tc = json.dumps(resulttc, indent=4)
+
+        # Format the system prompt with the selected requirements
+        formatted_sys_prompt = system_prompt.format(
+            layout=layout,
+            FHIR_Resource=FHIR_Resource
+        )
+
+        # Format the user prompt
+        formatted_user_prompt = User_prompt.format(
+            mapping_json_template=json_result,
+            layout=layout,
+            FHIR_Resource=FHIR_Resource,
+            test_case_csv=json_result_tc,
+            sample_HL7=resultip,
+            chglog_1=chglog
+        )
+
+        return formatted_sys_prompt, formatted_user_prompt
