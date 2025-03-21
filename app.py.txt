@@ -1,0 +1,255 @@
+import os
+import pandas as pd
+import json
+import io
+import logging
+import traceback
+import re
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+import uvicorn
+from backend.core import Core
+from backend.llm import LLM
+from backend.data import FHIR_Resource_list, Layout_list
+
+# Configure logging
+logging.basicConfig(
+    filename="api.log",
+    level=logging.ERROR,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+app = FastAPI(
+    title="CDR Test Case Generation API",
+    description="API for generating test cases for CDR validation",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
+
+# Pydantic models for request and response
+class TestCaseRequest(BaseModel):
+    layout_type: str
+    fhir_resource: str
+    changelog: Optional[str] = ""
+    display_prompt: bool = False
+
+class TestCaseResponse(BaseModel):
+    status: str
+    message: str
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+async def process_files(
+    mapping_csv_content: bytes,
+    test_case_csv_content: Optional[bytes] = None,
+    sample_hl7_content: Optional[bytes] = None
+):
+    """
+    Process the uploaded files.
+    
+    Args:
+        mapping_csv_content: The mapping CSV file content (required)
+        test_case_csv_content: The test case CSV file content (optional)
+        sample_hl7_content: Sample HL7 file content (optional)
+    """
+    
+    try:
+        # Create file-like objects
+        mapping_csv_buffer = io.BytesIO(mapping_csv_content)
+        mapping_df = pd.read_csv(mapping_csv_buffer, header=1)
+        
+        test_case_df = None
+        if test_case_csv_content:
+            test_case_buffer = io.BytesIO(test_case_csv_content)
+            test_case_df = pd.read_csv(test_case_buffer)
+        
+        hl7_content = None
+        if sample_hl7_content:
+            hl7_content = sample_hl7_content.decode('utf-8')
+        
+        return {
+            "mapping_df": mapping_df,
+            "test_case_df": test_case_df,
+            "hl7_content": hl7_content
+        }
+        
+    except Exception as e:
+        logging.error(f"Error processing files: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Error processing files: {str(e)}")
+
+@app.get("/")
+async def root():
+    return {"message": "CDR Test Case Generation API is running"}
+
+@app.get("/options")
+async def get_options():
+    """
+    Get all available layout and FHIR resource options
+    """
+    return {
+        "layout_options": Layout_list,
+        "fhir_resource_options": FHIR_Resource_list
+    }
+
+@app.post("/generate-test-cases", response_model=TestCaseResponse)
+async def generate_test_cases(
+    background_tasks: BackgroundTasks,
+    layout_type: str = Form(...),
+    fhir_resource: str = Form(...),
+    changelog: Optional[str] = Form(""),
+    display_prompt: bool = Form(False),
+    mapping_csv: UploadFile = File(...),
+    test_case_csv: Optional[UploadFile] = None,
+    sample_hl7: Optional[UploadFile] = None
+):
+    """
+    Generate test cases based on uploaded files and configuration
+    """
+    try:
+        # Validate layout_type and fhir_resource
+        if layout_type not in Layout_list:
+            raise HTTPException(status_code=400, detail=f"Invalid layout_type. Must be one of: {', '.join(Layout_list)}")
+        
+        if fhir_resource not in FHIR_Resource_list:
+            raise HTTPException(status_code=400, detail=f"Invalid fhir_resource. Must be one of: {', '.join(FHIR_Resource_list)}")
+        
+        # Read file contents
+        mapping_csv_content = await mapping_csv.read()
+        
+        test_case_csv_content = None
+        if test_case_csv:
+            test_case_csv_content = await test_case_csv.read()
+        
+        sample_hl7_content = None
+        if sample_hl7:
+            sample_hl7_content = await sample_hl7.read()
+        
+        # Process files
+        file_data = await process_files(
+            mapping_csv_content,
+            test_case_csv_content,
+            sample_hl7_content
+        )
+        
+        # Core processing
+        core = Core()
+        formatted_sys_prompt, formatted_user_prompt = core.dataprocessing(
+            file_data["mapping_df"],
+            layout_type,
+            fhir_resource,
+            file_data["test_case_df"],
+            file_data["hl7_content"],
+            changelog
+        )
+        
+        # Load configuration from environment variables
+        project_id = os.environ.get('project_id')
+        location = os.environ.get('location')
+        service_account_path = os.environ.get('service_account_path')
+        
+        if not all([project_id, location, service_account_path]):
+            raise HTTPException(
+                status_code=500, 
+                detail="Missing required environment variables: project_id, location, or service_account_path"
+            )
+        
+        # Initialize Vertex AI
+        LLM.initialize_vertex_ai(project_id, location, service_account_path)
+        
+        # Combine prompts
+        concat_prompt = f"*System Prompt:* {formatted_sys_prompt}\n *User Prompt:* {formatted_user_prompt}"
+        
+        # Call the LLM
+        response = LLM.call_gemini_langgraph(concat_prompt, project_id, location)
+        
+        # Process response
+        # DELIMITERS
+        generated_test_cases_delimiter = r"Test Case ID\|Subtype\|Test Case Type\|Test Case Description\|Expected Output\|Test Steps\|Pass/Fail Criteria\n"
+        summary_delimiter = r"Statistical Summary\n"
+        
+        # SPLITTING WITH REGEX
+        generated_test_cases_match = re.search(
+            generated_test_cases_delimiter + r"(.*?)(" + summary_delimiter + r".*?$)", 
+            response, 
+            re.DOTALL
+        )
+        
+        summary_match = re.search(summary_delimiter + r"(.*)", response, re.DOTALL)
+        
+        # EXTRACTING DATA
+        generated_test_cases_data = generated_test_cases_match.group(1).strip() if generated_test_cases_match else None
+        summary_data = summary_match.group(1).strip() if summary_match else None
+        
+        # Create DF objects and convert to dict
+        result_data = {
+            "raw_response": response,
+            "prompt": concat_prompt if display_prompt else None,
+        }
+        
+        if generated_test_cases_data:
+            try:
+                generated_test_cases_df = pd.read_csv(
+                    io.StringIO(generated_test_cases_delimiter.replace(r"\n", "") + "\n" + generated_test_cases_data), 
+                    sep="|"
+                )
+                result_data["generated_test_cases"] = generated_test_cases_df.to_dict(orient='records')
+            except Exception as e:
+                logging.error(f"Error creating generated_test_cases_df: {traceback.format_exc()}")
+                result_data["generated_test_cases_error"] = str(e)
+        
+        if summary_data:
+            # Process summary data
+            summary_rows = summary_data.split("\n")
+            summary_dict = {}
+            
+            for row in summary_rows:
+                # Remove leading/trailing whitespace from the row
+                row = row.strip()
+                
+                # Skip empty rows or rows without a colon (or rows that are just comments)
+                if not row or ":" not in row or row.startswith("#"):
+                    continue
+                    
+                # Remove the asterisk and any leading/trailing whitespace 
+                row = row.replace("*", "").strip()
+                
+                # Split the row at the first colon only
+                key, value = row.split(":", 1)
+                
+                # Store the key-value pair in the dictionary, after stripping whitespace
+                summary_dict[key.strip()] = value.strip()
+            
+            result_data["summary"] = summary_dict
+        
+        return {
+            "status": "success",
+            "message": "Test cases generated successfully",
+            "data": result_data
+        }
+        
+    except HTTPException as e:
+        # Re-raise FastAPI HTTP exceptions
+        raise
+        
+    except Exception as e:
+        logging.error(f"Error during processing: {traceback.format_exc()}")
+        return {
+            "status": "error",
+            "message": "Failed to generate test cases",
+            "error": str(e)
+        }
+
+if __name__ == "__main__":
+    # This will only run when directly executing this file
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
