@@ -1,0 +1,47 @@
+import vertexai
+from google.auth import default
+from google.oauth2 import service_account
+from vertexai.generative_models import GenerativeModel, Part, SafetySetting
+from langchain_google_vertexai import VertexAI
+
+
+class LLM:
+    @staticmethod
+    def initialize_vertex_ai(project_id, location, service_account_path=None):
+        """
+        Initializes Vertex AI. Uses a service account if provided, otherwise Application Default Credentials (ADC).
+        """
+        if service_account_path:
+            credentials = service_account.Credentials.from_service_account_file(service_account_path)
+            vertexai.init(project=project_id, location=location, credentials=credentials)
+            print("Vertex AI initialized using service account.")
+        else:
+            credentials, project = default()
+            vertexai.init(project=project_id, location=location, credentials=credentials)
+            print("Vertex AI initialized using Application Default Credentials.")
+
+    @staticmethod
+    def initialize_llm(project_id, location):
+        """
+        Initializes the Gemini LLM through LangChain's VertexAI integration.
+        """
+        vertexai.init(project=project_id, location=location)
+
+        llm = VertexAI(
+            model_name="gemini-2.0-pro-exp-02-05",
+            max_output_tokens=8192,
+            temperature=0.1,
+            top_p=0.95,
+        )
+        return llm
+
+    @staticmethod
+    def call_gemini_langgraph(concat_prompt, project_id, location):
+        """
+        Calls Gemini using LangGraph.
+        """
+        llm_instance = LLM.initialize_llm(project_id, location)
+
+        # Invoke the model with the given prompt
+        results = llm_instance.invoke(concat_prompt)
+        return results
